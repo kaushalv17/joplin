@@ -1595,9 +1595,12 @@ const TinyMCE = (props: NoteBodyEditorProps, ref: Ref<NoteBodyEditorRef>) => {
 	// Search-entry pre-population is currently only done in the Markdown editor.
 	const globalSearchTermRef = useRef<string>('');
 
+	// FIX 1 (stale ref): Remove the early-return guard so that clearing globalSearchTermRef
+	// is not skipped when props.searchMarkers becomes null/undefined. Previously, returning
+	// early meant a stale term would still be injected on the next Ctrl+F after the user
+	// had cleared the global search bar.
 	useEffect(() => {
-		if (!props.searchMarkers) return;
-		const keywords = props.searchMarkers.keywords;
+		const keywords = props.searchMarkers?.keywords;
 		globalSearchTermRef.current = (keywords && keywords.length > 0)
 			? (keywords[0]?.value ?? '')
 			: '';
@@ -1605,6 +1608,12 @@ const TinyMCE = (props: NoteBodyEditorProps, ref: Ref<NoteBodyEditorRef>) => {
 
 	useEffect(() => {
 		if (!editor) return () => {};
+
+		// Tracks every shim.setTimeout ID created during a polling cycle so they can
+		// all be cancelled in the cleanup function, preventing callbacks from firing
+		// against a stale editor after the component unmounts.
+		const pendingTimeouts: ReturnType<typeof shim.setTimeout>[] = [];
+		let cancelled = false;
 
 		const onKeyDown = (e: KeyboardEvent) => {
 			const isCtrlF = (e.ctrlKey || e.metaKey) && e.key === 'f';
@@ -1617,18 +1626,28 @@ const TinyMCE = (props: NoteBodyEditorProps, ref: Ref<NoteBodyEditorRef>) => {
 			let attempts = 0;
 
 			const tryFill = () => {
+				if (cancelled) return;
+
+				// FIX 2 (locale-agnostic selector): The previous selector
+				// '.tox-textfield[placeholder="Find"]' matched the English
+				// placeholder text and would silently fail for every other locale.
+				// TinyMCE's searchreplace dialog always renders the Find field as
+				// the first .tox-textfield inside .tox-dialog, so we target by
+				// structural position instead — this works regardless of locale.
 				const input = document.querySelector<HTMLInputElement>(
-					'.tox-textfield[placeholder="Find"]',
+					'.tox-dialog .tox-textfield',
 				);
 
 				if (!input) {
 					attempts++;
 					if (attempts < maxAttempts) {
-						shim.setTimeout(tryFill, 50);
+						pendingTimeouts.push(shim.setTimeout(tryFill, 50));
 					}
 					return;
 				}
-				shim.setTimeout(() => {
+
+				pendingTimeouts.push(shim.setTimeout(() => {
+					if (cancelled) return;
 					const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
 						window.HTMLInputElement.prototype, 'value',
 					)?.set;
@@ -1636,16 +1655,20 @@ const TinyMCE = (props: NoteBodyEditorProps, ref: Ref<NoteBodyEditorRef>) => {
 					input.dispatchEvent(new Event('input', { bubbles: true }));
 					input.dispatchEvent(new Event('change', { bubbles: true }));
 					focus('TinyMCE::searchDialog', input);
-				}, 50);
+				}, 50));
 			};
 
-			shim.setTimeout(tryFill, 50);
+			pendingTimeouts.push(shim.setTimeout(tryFill, 50));
 		};
 
 		document.addEventListener('keydown', onKeyDown);
 		editor.getDoc()?.addEventListener('keydown', onKeyDown);
 
 		return () => {
+			cancelled = true;
+			for (const id of pendingTimeouts) {
+				shim.clearTimeout(id);
+			}
 			document.removeEventListener('keydown', onKeyDown);
 			editor.getDoc()?.removeEventListener('keydown', onKeyDown);
 		};
@@ -1749,4 +1772,3 @@ const TinyMCE = (props: NoteBodyEditorProps, ref: Ref<NoteBodyEditorRef>) => {
 };
 
 export default forwardRef(TinyMCE);
-
